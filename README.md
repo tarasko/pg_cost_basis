@@ -4,57 +4,84 @@ Implemented in C++, much faster than pure SQL or PLPGSQL alternative.
 Currently, only ACB and FIFO methods are supported. Feel free to contribute other methods (LIFO, HIFO etc). 
 I'm also open to changing the existing interface. It's not set in stone.
 
-### Example
-Create test_data view.
+## Example
+### Create test_data view.
 ```
 create or replace view test_data as 
 select *, lag(tag, 1) over (order by tag) prev_tag 
 from (
 	values
-	-- acquire some assets on 2 different exchanges
+	-- acquire some assets on 2 exchanges
 	('exch_2', null, 1000, 2, 1, null::bool, null),
 	('exch_1', null, 1100, 1, 2, null::bool, null),
 	
 	-- transfer assets from exch_2 to exch_1
-	-- out-record should always go first and has negative amount
-	-- in-record goes later, not necessary immediately. In-record finalize transfer.
 	-- match out/in transfer records by transfer_id
 	('exch_2', 'exch_1', null, -2, 3, null::bool, 'transfer1'), 
 	('exch_1', 'exch_2', null, 2, 4, null::bool, 'transfer1'),
-  
-	('exch_1', null, 1500, -3, 5, null::bool, null),	  -- dispose
-	('exch_1', null, 2000, 1, 6, null::bool, null),     -- buy more
-	('exch_1', null, 2100, -2, 7, null::bool, null),    -- dispose and go negative 
-	('exch_1', null, 2000, 2, 8, null::bool, null),     -- close negative position, acquire some
-	-- transfer from exch_1 to exch_2
-	-- transfer_id is null (not available), so match out/in records by (source, destination, amount)
-	('exch_1', 'exch_2', null, -1, 9, null::bool, null),
-	('exch_2', 'exch_1', null, 1, 10, null::bool, null)		
+	
+	('exch_1', null, 1400, -1, 5, null::bool, null),	
+	('exch_1', null, 1500, -2, 6, null::bool, null),	
+	('exch_1', null, 2000, 1, 7, null::bool, null),
+	('exch_1', null, 2100, -2, 8, null::bool, null),
+	('exch_1', null, 2000, 2, 9, null::bool, null),
+	
+	-- transfer without transfer_id, match out/in records by triplet (source, destination, amount)
+	('exch_1', 'exch_2', null, -1, 10, null::bool, null),
+	('exch_2', 'exch_1', null, 1, 11, null::bool, null)		
 	)
 as t(account, dest_account, price, amount, tag, ignore_transfer, transfer_id);
 ```
-Calculate realized gains using average cost basis (ACB) method
+### Calculate realized gains using average cost basis (ACB) method
 ```
-select *,
-	cb_acb_capital_gain(s),
-	cb_acb_cost_basis_before(s),
-	cb_acb_balance_before(s),
-	cb_acb_cost_basis_after(s),
-	cb_acb_balance_after(s)
+select account, dest_account, price, amount, tag, transfer_id,
+	cb_acb_capital_gain(s) capital_gain,
+	cb_acb_balance_before(s) balance_before,
+	cb_acb_balance_after(s) balance_after,
+	cb_acb_cost_basis_before(s) cost_basis_before,
+	cb_acb_cost_basis_after(s) cost_basis_after
 from (
 	select *, cb_acb(price, case when dest_account is null then amount else 0.0 end) over (order by tag) s
 	from test_data
 )
 ```
-Calculate realized gains using first-in-first-out (FIFO) method
+|account|dest_account|price|amount|tag|transfer_id|capital_gain|balance_before|balance_after|cost_basis_before|cost_basis_after|
+|-------|------------|-----|------|---|-----------|------------|--------------|-------------|-----------------|----------------|
+|exch_2|[NULL]|1,000|2|1|[NULL]|0|0|2|1|1,000|
+|exch_1|[NULL]|1,100|1|2|[NULL]|0|2|3|1,000|1,033.3333333333|
+|exch_2|exch_1|[NULL]|-2|3|transfer1|0|3|3|1,033.3333333333|1,033.3333333333|
+|exch_1|exch_2|[NULL]|2|4|transfer1|0|3|3|1,033.3333333333|1,033.3333333333|
+|exch_1|[NULL]|1,400|-1|5|[NULL]|366.6666666667|3|2|1,033.3333333333|1,033.3333333333|
+|exch_1|[NULL]|1,500|-2|6|[NULL]|933.3333333333|2|0|1,033.3333333333|1,033.3333333333|
+|exch_1|[NULL]|2,000|1|7|[NULL]|0|0|1|1,033.3333333333|2,000|
+|exch_1|[NULL]|2,100|-2|8|[NULL]|100|1|-1|2,000|2,100|
+|exch_1|[NULL]|2,000|2|9|[NULL]|100|-1|1|2,100|2,000|
+|exch_1|exch_2|[NULL]|-1|10|[NULL]|0|1|1|2,000|2,000|
+|exch_2|exch_1|[NULL]|1|11|[NULL]|0|1|1|2,000|2,000|
+
+### Calculate realized gains using first-in-first-out (FIFO) method
 ```
-select *,
-	cb_fifo_capital_gain(fifo),
-	cb_fifo_realized_tags(fifo),
-	cb_fifo_realized_entries(fifo)
+select account, dest_account, price, amount, tag, transfer_id,
+	cb_fifo_capital_gain(fifo) capital_gain,
+	cb_fifo_realized_tags(fifo) realized_tags,
+	cb_fifo_realized_entries(fifo) realized_entries
 from (
 	select *, 
 		cb_fifo(account, dest_account, price, amount, tag, prev_tag, ignore_transfer, transfer_id) over (order by tag) fifo
 	from test_data
 )
 ```
+
+|account|dest_account|price|amount|tag|transfer_id|capital_gain|realized_tags|realized_entries|
+|-------|------------|-----|------|---|-----------|------------|-------------|----------------|
+|exch_2|[NULL]|1,000|2|1|[NULL]|0|{}|[]|
+|exch_1|[NULL]|1,100|1|2|[NULL]|0|{}|[]|
+|exch_2|exch_1|[NULL]|-2|3|transfer1|0|{}|[]|
+|exch_1|exch_2|[NULL]|2|4|transfer1|0|{}|[]|
+|exch_1|[NULL]|1,400|-1|5|[NULL]|300|{2}|[{"a": 1.00000000, "t": 2, "cb": 1100.00000000, "pl": 300.00000000}]|
+|exch_1|[NULL]|1,500|-2|6|[NULL]|1,000|{1}|[{"a": 2.00000000, "t": 1, "cb": 1000.00000000, "pl": 1000.00000000}]|
+|exch_1|[NULL]|2,000|1|7|[NULL]|0|{}|[]|
+|exch_1|[NULL]|2,100|-2|8|[NULL]|100|{7}|[{"a": 1.00000000, "t": 7, "cb": 2000.00000000, "pl": 100.00000000}]|
+|exch_1|[NULL]|2,000|2|9|[NULL]|100|{8}|[{"a": -1.00000000, "t": 8, "cb": 2100.00000000, "pl": 100.00000000}]|
+|exch_1|exch_2|[NULL]|-1|10|[NULL]|0|{}|[]|
+|exch_2|exch_1|[NULL]|1|11|[NULL]|0|{}|[]|
