@@ -8,7 +8,7 @@ I'm also open to changing the existing interface. It's not set in stone.
 # Make sure that you have postgresql-server-dev installed. 
 sudo apt install postgresql-server-dev-16
 
-Clone the extension, make build directory inside, run cmake and then make install
+# Clone the extension, make build directory inside, run cmake and then make install
 cd pg_cost_basis
 mkdir build
 cd build
