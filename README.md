@@ -1,5 +1,5 @@
-# pg_cost_basis
-Postgres extension with aggregates that help to track assets cost basis and calculate realized capital gains.
+# Overview
+This Postgres extension introduces aggregates that help to track assets cost basis and calculate realized capital gains.
 Implemented in C++, much faster than pure SQL or PLPGSQL alternative. 
 Currently, only ACB and FIFO methods are supported. Feel free to contribute other methods (LIFO, HIFO etc). 
 I'm also open to changing the existing interface. It's not set in stone.
