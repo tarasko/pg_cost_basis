@@ -3,6 +3,22 @@ Postgres extension with aggregates that help to track assets cost basis and calc
 Implemented in C++, much faster than pure SQL or PLPGSQL alternative. 
 Currently, only ACB and FIFO methods are supported. Feel free to contribute other methods (LIFO, HIFO etc). 
 I'm also open to changing the existing interface. It's not set in stone.
+## Build and install
+```
+# Make sure that you have postgresql-server-dev installed. 
+sudo apt install postgresql-server-dev-16
+
+Clone the extension, make build directory inside, run cmake and then make install
+cd pg_cost_basis
+mkdir build
+cd build
+cmake -DCMAKE_BUILD_TYPE=Release ..
+sudo make VERBOSE=1 install
+```
+Now, connect to the database and register the extension
+```
+create extension pg_cost_basis;
+```
 
 ## Example
 ### Create test_data view.
