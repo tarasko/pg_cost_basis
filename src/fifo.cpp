@@ -391,7 +391,7 @@ private:
     // Contains last realized records. Capital gains are calculated against mLastPrice
     RealizedList mLastRealized;
     // Last realized price
-    double mLastPrice = 1.0;
+    double mLastPrice;
 };
 
 // IMPORTANT: If this fails, change the expected size and adjust(!!!) pg_cost_basis--*.sql
