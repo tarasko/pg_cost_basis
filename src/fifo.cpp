@@ -76,7 +76,7 @@ struct CbAccountEntry
 
 struct CbTransfer
 {
-    // Some transfers can provide unique transfer id, in this case it's much more reliable to match outgoing and incoming records
+    // Some transfers can provide unique transfer id, in this case it's a preferred way to match outgoing and incoming records
     std::optional<PgString> mTransferId;
 
     // For the rest, we rely on triplet (source, dest, amount)
@@ -84,14 +84,14 @@ struct CbTransfer
     PgString mDestinationAccount;
     double mAmount;
 
-    PgVector<CbAccountEntry> mRecords;
+    PgVector<CbAccountEntry> mEntries;
 
     bool operator==(const CbTransfer& o) const
     {
         if (mTransferId.has_value() && o.mTransferId.has_value())
             return mTransferId == o.mTransferId;
 
-        // if transfer_id is defined for either in or out records then it should be defined for both records
+        // if mTransferId is defined for either in or out record then it should be defined for both records
         if (mTransferId.has_value() != o.mTransferId.has_value())
             return false;
 
@@ -99,9 +99,13 @@ struct CbTransfer
     }
 };
 
-struct CbFifoState
+class CbFifoState
 {
     using Fifo = PgDeque<CbAccountEntry>;
+
+    // Use vector instead of deque since we don't need to pop_front
+    // Default-constructed empty deque is also allocating twice to initialize its internal structure.
+    // We don't want that, typically half of records are acquisions (amount > 0), they have empty realized list.
     using RealizedList = PgVector<CbAccountEntry>;
 
     struct SharedState
@@ -110,11 +114,14 @@ struct CbFifoState
         PgVector<CbTransfer> mTransfers;
     };
 
+    CbFifoState(SharedState* sharedState, double price) : mSharedState{sharedState}, mLastPrice{price} {}
+
     [[nodiscard]] static double totalFifoBalance(const Fifo& fifo) noexcept
     {
         return std::accumulate(fifo.cbegin(), fifo.cend(), 0.0, [](double total, const auto& entry) { return total + entry.mAmount; });
     }
 
+public:
     [[nodiscard]] static CbFifoState* newState(CbFifoState* oldState = nullptr, double price = 1.0)
     {
         SharedState* sharedState = oldState == nullptr ?
@@ -148,12 +155,12 @@ struct CbFifoState
             if (remainingAmountToTransfer > entry.mAmount)
             {
                 remainingAmountToTransfer -= entry.mAmount;
-                transfer.mRecords.push_back(CbAccountEntry{entry.mOriginatingAccount, entry.mOriginatingTag, entry.mCostBasis, entry.mAmount});
+                transfer.mEntries.push_back(CbAccountEntry{entry.mOriginatingAccount, entry.mOriginatingTag, entry.mCostBasis, entry.mAmount});
                 accountFifo.pop_front();
             }
             else
             {
-                transfer.mRecords.push_back(CbAccountEntry{entry.mOriginatingAccount, entry.mOriginatingTag, entry.mCostBasis, remainingAmountToTransfer});
+                transfer.mEntries.push_back(CbAccountEntry{entry.mOriginatingAccount, entry.mOriginatingTag, entry.mCostBasis, remainingAmountToTransfer});
                 entry.mAmount -= remainingAmountToTransfer;
                 remainingAmountToTransfer = 0.0;
                 if (entry.mAmount < AMOUNT_EPSILON)
@@ -174,11 +181,11 @@ struct CbFifoState
         return CbFifoState::newState(this);
     }
 
-    [[nodiscard]] CbFifoState* finalizeTransfer(const PgString& account, const PgString& sourceAccount, const std::optional<PgString>& txId, double amount, int64_t tag)
+    [[nodiscard]] CbFifoState* finalizeTransfer(const PgString& account, const PgString& sourceAccount, const std::optional<PgString>& transferId, double amount, int64_t tag)
     {
         CbFifoState::Fifo& accountFifo = mSharedState->mAccountEntries[account];
 
-        CbTransfer transferKey{txId, sourceAccount, account, amount, {}};
+        CbTransfer transferKey{transferId, sourceAccount, account, amount, {}};
         auto transferIter = std::find(mSharedState->mTransfers.begin(), mSharedState->mTransfers.end(), transferKey);
         if (transferIter == mSharedState->mTransfers.end()) [[unlikely]]
         {
@@ -198,7 +205,7 @@ struct CbFifoState
             return newState(this);
         }
 
-        accountFifo.insert(accountFifo.end(), transferIter->mRecords.begin(), transferIter->mRecords.end());
+        accountFifo.insert(accountFifo.end(), transferIter->mEntries.begin(), transferIter->mEntries.end());
         mSharedState->mTransfers.erase(transferIter);
 
         return CbFifoState::newState(this);
@@ -378,14 +385,12 @@ struct CbFifoState
     }
 
 private:
-    CbFifoState(SharedState* sharedState, double price) : mSharedState{sharedState}, mLastPrice{price} {}
-
-private:
     // Allocated in CurTransactionContext, shared between calls, never freed explicitly
+    // Contains fifo queues for each account and pending asset transfers
     SharedState* mSharedState;
-    // Contains the list of last realized amounts with PnL
+    // Contains last realized records. Capital gains are calculated against mLastPrice
     RealizedList mLastRealized;
-    // The last realized price
+    // Last realized price
     double mLastPrice = 1.0;
 };
 
@@ -470,7 +475,11 @@ Datum CbFifo_sfunc(PG_FUNCTION_ARGS)
     }
     double amount = PG_GETARG_FLOAT8(4);
 
-    // We should reset the state, if there is no previous tag in the group
+    // Reset the state when there is no previous tag in the group
+    // I was very surprised to learn that
+    // cb_fifo(...) over (partition by ... order by tag)
+    // doesn't create a new aggregate for each partition, but just tries to re-use state from previous partition
+    // This helps to detect that we begin with a new partition.
     if (PG_ARGISNULL(6)) [[unlikely]]
     {
         state->validateAtEnd();
@@ -487,8 +496,6 @@ Datum CbFifo_sfunc(PG_FUNCTION_ARGS)
                     (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                      errmsg("%lu: price can't be null", tag)));
         }
-
-        // regular entry
         double price = PG_GETARG_FLOAT8(3);
 
         newState = state->realize(account, price, amount, tag);

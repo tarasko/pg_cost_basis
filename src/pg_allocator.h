@@ -72,8 +72,8 @@ struct PgAllocator
 
     [[nodiscard]] value_type* allocate(std::size_t n) const noexcept
     {
-        // palloc uses postgresql exception mechanism (implemented via longjmp) in case when memory can't be allocated.
-        // no need to check return values
+        // On error palloc uses postgresql exception mechanism (implemented via longjmp).
+        // no need to check for nullptr here
         return static_cast<value_type*>(pallocHook<value_type>(n));
     }
 
