@@ -131,7 +131,7 @@ public:
         return new (pallocHook<CbFifoState>()) CbFifoState{sharedState, price};
     }
 
-    [[nodiscard]] CbFifoState* initiateTransfer(const PgString& account, const PgString& destinationAccount, const std::optional<PgString>& txId, double amount, int64_t tag)
+    [[nodiscard]] CbFifoState* initiateTransfer(const PgString& account, const PgString& destinationAccount, const std::optional<PgString>& txId, double amount, std::optional<double> price, int64_t tag)
     {
         CbFifoState::Fifo& accountFifo = mSharedState->mAccountEntries[account];
 
@@ -168,12 +168,20 @@ public:
             }
         }
 
-        if (remainingAmountToTransfer >= AMOUNT_EPSILON) [[unlikely]]
+        if (remainingAmountToTransfer >= TRANSFER_AMOUNT_EPSILON)
         {
-            ereport(ERROR,
-                    (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                     errmsg("%ld: not enough balance on \"%s\", %g left untransfered",
-                            tag, account.c_str(), remainingAmountToTransfer)));
+            if (price.has_value())
+            {
+                transfer.mEntries.push_back(CbAccountEntry{account, tag, *price, remainingAmountToTransfer});
+                accountFifo.push_back(CbAccountEntry{account, tag, *price, -remainingAmountToTransfer});
+            }
+            else
+            {
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("%ld: not enough balance on \"%s\", %g left untransfered",
+                                tag, account.c_str(), remainingAmountToTransfer)));
+            }
         }
 
         mSharedState->mTransfers.push_back(std::move(transfer));
@@ -205,10 +213,13 @@ public:
             return newState(this);
         }
 
-        accountFifo.insert(accountFifo.end(), transferIter->mEntries.begin(), transferIter->mEntries.end());
+        CbFifoState* newState = CbFifoState::newState(this);
+        for (auto& e : transferIter->mEntries)
+            newState->realizeImpl(accountFifo, account, e.mCostBasis, e.mAmount, e.mOriginatingTag);
+
         mSharedState->mTransfers.erase(transferIter);
 
-        return CbFifoState::newState(this);
+        return newState;
     }
 
     [[nodiscard]] CbFifoState* realize(const PgString& account, double price, double amount, int64_t tag)
@@ -216,35 +227,7 @@ public:
         CbFifoState::Fifo& accountFifo = mSharedState->mAccountEntries[account];
         CbFifoState* newState = CbFifoState::newState(this, price);
 
-        if (std::abs(amount) < AMOUNT_EPSILON)
-            return newState;
-
-        double remainingAmount = amount;
-
-        while (std::abs(remainingAmount) >= AMOUNT_EPSILON && !accountFifo.empty() && std::signbit(accountFifo.front().mAmount) != std::signbit(remainingAmount))
-        {
-            auto& entry = accountFifo.front();
-            if (std::signbit(entry.mAmount) == std::signbit(entry.mAmount + remainingAmount))
-            {
-                // don't cross 0
-                newState->mLastRealized.push_back(CbAccountEntry{entry.mOriginatingAccount, entry.mOriginatingTag, entry.mCostBasis, -remainingAmount});
-                entry.mAmount += remainingAmount;
-                remainingAmount = 0.0;
-                if (std::abs(entry.mAmount) < AMOUNT_EPSILON)
-                    accountFifo.pop_front();
-            }
-            else
-            {
-                // cross 0
-                newState->mLastRealized.push_back(CbAccountEntry{entry.mOriginatingAccount, entry.mOriginatingTag, entry.mCostBasis, entry.mAmount});
-                remainingAmount += entry.mAmount;
-                accountFifo.pop_front();
-            }
-        }
-
-        if (std::abs(remainingAmount) >= AMOUNT_EPSILON)
-            accountFifo.push_back(CbAccountEntry{account, tag, price, remainingAmount});
-
+        newState->realizeImpl(accountFifo, account, price, amount, tag);
         return newState;
     }
 
@@ -385,6 +368,38 @@ public:
     }
 
 private:
+    void realizeImpl(CbFifoState::Fifo& accountFifo, const PgString& account, double price, double amount, int64_t tag)
+    {
+        if (std::abs(amount) < AMOUNT_EPSILON)
+            return;
+
+        double remainingAmount = amount;
+
+        while (std::abs(remainingAmount) >= AMOUNT_EPSILON && !accountFifo.empty() && std::signbit(accountFifo.front().mAmount) != std::signbit(remainingAmount))
+        {
+            auto& entry = accountFifo.front();
+            if (std::signbit(entry.mAmount) == std::signbit(entry.mAmount + remainingAmount))
+            {
+                // don't cross 0
+                mLastRealized.push_back(CbAccountEntry{entry.mOriginatingAccount, entry.mOriginatingTag, entry.mCostBasis, -remainingAmount});
+                entry.mAmount += remainingAmount;
+                remainingAmount = 0.0;
+                if (std::abs(entry.mAmount) < AMOUNT_EPSILON)
+                    accountFifo.pop_front();
+            }
+            else
+            {
+                // cross 0
+                mLastRealized.push_back(CbAccountEntry{entry.mOriginatingAccount, entry.mOriginatingTag, entry.mCostBasis, entry.mAmount});
+                remainingAmount += entry.mAmount;
+                accountFifo.pop_front();
+            }
+        }
+
+        if (std::abs(remainingAmount) >= AMOUNT_EPSILON)
+            accountFifo.push_back(CbAccountEntry{account, tag, price, remainingAmount});
+    }
+
     // Allocated in CurTransactionContext, shared between calls, never freed explicitly
     // Contains fifo queues for each account and pending asset transfers
     SharedState* mSharedState;
@@ -506,6 +521,10 @@ Datum CbFifo_sfunc(PG_FUNCTION_ARGS)
         if (!PG_ARGISNULL(7))
             ignoreTransfer = PG_GETARG_BOOL(7);
 
+        std::optional<double> price;
+        if (!PG_ARGISNULL(3))
+            price = PG_GETARG_FLOAT8(3);
+
         if (ignoreTransfer)
             newState = CbFifoState::newState(state);
         else
@@ -517,7 +536,7 @@ Datum CbFifo_sfunc(PG_FUNCTION_ARGS)
             if (amount < 0)
             {
                 PgString destinationAccount = textToString<PgString>(PG_GETARG_TEXT_PP(2));
-                newState = state->initiateTransfer(account, destinationAccount, transferId, amount, tag);
+                newState = state->initiateTransfer(account, destinationAccount, transferId, amount, price, tag);
             }
             else
             {
