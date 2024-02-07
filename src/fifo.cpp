@@ -25,10 +25,6 @@ namespace {
 template<typename T>
 using PgDeque = std::deque<T, PgAllocator<T>>;
 
-} // namespace {
-
-namespace {
-
 char jsTagKey[] = "t";
 char jsAmountKey[] = "a";
 char jsPlKey[] = "pl";
@@ -47,7 +43,7 @@ class CbFifoState
     using Fifo = PgDeque<CbFifoAccountEntry>;
 
     // Use vector instead of deque since we don't need to pop_front
-    // Default-constructed empty deque is also allocating twice to initialize its internal structure.
+    // Default-constructed empty deque allocating twice to initialize its internal structure.
     // We don't want that, typically half of records are acquisions (amount > 0), they have empty realized list.
     using RealizedList = PgVector<CbFifoAccountEntry>;
 
@@ -57,12 +53,13 @@ class CbFifoState
         PgVector<CbTransfer<CbFifoAccountEntry>> mTransfers;
     };
 
-    CbFifoState(SharedState* sharedState, double price) : mSharedState{sharedState}, mLastPrice{price} {}
-
-    [[nodiscard]] static double totalFifoBalance(const Fifo& fifo) noexcept
-    {
-        return std::accumulate(fifo.cbegin(), fifo.cend(), 0.0, [](double total, const auto& entry) { return total + entry.mAmount; });
-    }
+    // Allocated in CurTransactionContext, shared between calls, never freed explicitly
+    // Contains fifo queues for each account and pending asset transfers
+    SharedState* mSharedState;
+    // Contains last realized records. Capital gains are calculated against mLastPrice
+    RealizedList mLastRealized;
+    // Last realized price
+    double mLastPrice;
 
 public:
     [[nodiscard]] static CbFifoState* newState(CbFifoState* oldState = nullptr, double price = 1.0)
@@ -74,7 +71,10 @@ public:
         return new (pallocHook<CbFifoState>()) CbFifoState{sharedState, price};
     }
 
-    [[nodiscard]] CbFifoState* initiateTransfer(const PgString& account, const PgString& destinationAccount, const std::optional<PgString>& txId, double amount, std::optional<double> price, int64_t tag)
+    [[nodiscard]] CbFifoState* initiateTransfer(
+            const PgString& account, const PgString& destinationAccount, const std::optional<PgString>& txId,
+            double amount, std::optional<double> price,
+            int64_t tag)
     {
         CbFifoState::Fifo& accountFifo = mSharedState->mAccountEntries[account];
 
@@ -310,7 +310,15 @@ public:
         }
     }
 
-private:
+private:    
+    CbFifoState(SharedState* sharedState, double price)
+        : mSharedState{sharedState}, mLastPrice{price} {}
+
+    [[nodiscard]] static double totalFifoBalance(const Fifo& fifo) noexcept
+    {
+        return std::accumulate(fifo.cbegin(), fifo.cend(), 0.0, [](double total, const auto& entry) { return total + entry.mAmount; });
+    }
+
     void realizeImpl(CbFifoState::Fifo& accountFifo, const PgString& account, double price, double amount, int64_t tag)
     {
         if (std::abs(amount) < AMOUNT_EPSILON)
@@ -342,14 +350,6 @@ private:
         if (std::abs(remainingAmount) >= AMOUNT_EPSILON)
             accountFifo.push_back(CbFifoAccountEntry{account, tag, price, remainingAmount});
     }
-
-    // Allocated in CurTransactionContext, shared between calls, never freed explicitly
-    // Contains fifo queues for each account and pending asset transfers
-    SharedState* mSharedState;
-    // Contains last realized records. Capital gains are calculated against mLastPrice
-    RealizedList mLastRealized;
-    // Last realized price
-    double mLastPrice;
 };
 
 // IMPORTANT: If this fails, change the expected size and adjust(!!!) pg_cost_basis--*.sql

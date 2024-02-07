@@ -1,41 +1,238 @@
+#include "common.h"
+#include "sfunc.h"
+
 #include <cmath>
 
 extern "C"
 {
 #include <postgres.h>
 #include <fmgr.h>
+}
 
-struct CbAcbState
+namespace {
+
+struct CbAcbAccountEntry
 {
-    double mCostBasisBefore;
-    double mCostBasisAfter;
-    double mBalanceBefore;
-    double mBalanceAfter;
-    double mCapitalGain;
+    double mCostBasis = 1.0;
+    double mAmount = 0;
+};
+
+class CbAcbState
+{
+    struct SharedState
+    {
+        PgUnorderedMap<PgString, CbAcbAccountEntry> mAccountEntries;
+        PgVector<CbTransfer<CbAcbAccountEntry>> mTransfers;
+    };
+
+    // Allocated in CurTransactionContext, shared between calls, never freed explicitly
+    // Contains (cost basis, amount) for each account and pending asset transfers
+    SharedState* mSharedState;
+
+    explicit CbAcbState(SharedState* sharedState)
+        : mSharedState(sharedState)
+    {}
+
+ public:
+    double mCostBasisBefore = 1.0;
+    double mCostBasisAfter = 1.0;
+    double mBalanceBefore = 0.0;
+    double mBalanceAfter = 0.0;
+    double mCapitalGain = 0.0;
+
+    [[nodiscard]] static CbAcbState* newState(CbAcbState* oldState = nullptr)
+    {
+        SharedState* sharedState = oldState == nullptr ?
+            new (pallocHook<CbAcbState::SharedState>()) CbAcbState::SharedState{} :
+            oldState->mSharedState;
+
+        return new (pallocHook<CbAcbState>()) CbAcbState{sharedState};
+    }
+
+    [[nodiscard]] CbAcbState* realize(const PgString& account, double price, double amount, int64_t tag)
+    {
+        CbAcbAccountEntry& accountEntry = mSharedState->mAccountEntries[account];
+        CbAcbState* newState = CbAcbState::newState(this);
+
+        newState->realizeImpl(accountEntry, price, amount);
+        return newState;
+    }
+
+    [[nodiscard]] CbAcbState* initiateTransfer(
+            const PgString& account, const PgString& destinationAccount, const std::optional<PgString>& txId,
+            double amount, std::optional<double> price,
+            int64_t tag)
+    {
+        CbAcbAccountEntry& accountEntry = mSharedState->mAccountEntries[account];
+        CbAcbState* newState = CbAcbState::newState(this);
+
+        newState->mCostBasisBefore = accountEntry.mCostBasis;
+        newState->mBalanceBefore = accountEntry.mAmount;
+        newState->mBalanceAfter = accountEntry.mAmount + amount;
+        newState->mCapitalGain = 0.0;
+
+        if (std::abs(newState->mBalanceAfter) < AMOUNT_EPSILON)
+            newState->mBalanceAfter = 0.0;
+
+        CbTransfer<CbAcbAccountEntry> transfer{txId, account, destinationAccount, -amount, {}};
+
+        // Depending on the case we should evaluate
+        // * newState->mCostBasisAfter
+        // * transferred entries
+        // * accountEntry (cost basis and resulting amount)
+        if (newState->mBalanceBefore < 0.0)
+        {
+            // We are already negative on the balance. Transfer here is akin to asset acquisition
+            if (!price.has_value())
+            {
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("tag %ld: not enough balance on \"%s\", %g left untransfered, price must be specifiied in order to go negative on transfers",
+                                tag, account.c_str(), std::abs(mBalanceAfter))));
+                return newState;
+            }
+            newState->mCostBasisAfter = (accountEntry.mCostBasis * accountEntry.mAmount + *price * amount) / (accountEntry.mAmount + amount);
+
+            transfer.mEntries.push_back({*price, -amount});
+
+            accountEntry.mAmount = newState->mBalanceAfter;
+            accountEntry.mCostBasis = newState->mCostBasisAfter;
+        }
+        else if (newState->mBalanceAfter < 0.0)
+        {
+            // Not enough balance to transfer, we're allowed to go negative if price is specified
+            // Price becomes cost basis for negative position
+            if (!price.has_value())
+            {
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("tag %ld: not enough balance on \"%s\", %g left untransfered",
+                                tag, account.c_str(), std::abs(mBalanceAfter))));
+                return newState;
+            }
+            newState->mCostBasisAfter = *price;
+
+            transfer.mEntries.push_back({newState->mCostBasisBefore, newState->mBalanceBefore});
+            transfer.mEntries.push_back({newState->mCostBasisAfter, -newState->mBalanceAfter});
+
+            accountEntry.mAmount = newState->mBalanceAfter;
+            accountEntry.mCostBasis = newState->mCostBasisAfter;
+        }
+        else
+        {
+            // Enough balance to transfer
+            newState->mCostBasisAfter = newState->mCostBasisBefore;
+
+            transfer.mEntries.push_back({accountEntry.mCostBasis, -amount});
+
+            accountEntry.mAmount = newState->mBalanceAfter;
+        }
+
+        mSharedState->mTransfers.push_back(std::move(transfer));
+        return newState;
+    }
+
+    [[nodiscard]] CbAcbState* finalizeTransfer(const PgString& account, const PgString& sourceAccount, const std::optional<PgString>& transferId, double amount, int64_t tag)
+    {
+        CbAcbAccountEntry& accountEntry = mSharedState->mAccountEntries[account];
+        CbAcbState* newState = CbAcbState::newState(this);
+
+        CbTransfer<CbAcbAccountEntry> transferKey{transferId, sourceAccount, account, amount, {}};
+        auto transferIter = std::find(mSharedState->mTransfers.begin(), mSharedState->mTransfers.end(), transferKey);
+        if (transferIter == mSharedState->mTransfers.end()) [[unlikely]]
+        {
+            ereport(ERROR,
+                    (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                     errmsg("tag %ld: can't finalize transfer %s -> %s %g, unable to match with initiating record",
+                            tag, sourceAccount.c_str(), account.c_str(), amount)));
+            return newState;
+        }
+
+        if (std::abs(transferIter->mAmount - amount) > TRANSFER_AMOUNT_EPSILON) [[unlikely]]
+        {
+            ereport(ERROR,
+                    (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                     errmsg("tag %ld: can't finalize transfer, in/out amounts mismatch: %g, %g",
+                            tag, transferIter->mAmount, amount)));
+            return newState;
+        }
+
+        for (auto& e : transferIter->mEntries)
+            newState->realizeImpl(accountEntry, e.mCostBasis, e.mAmount);
+
+        mSharedState->mTransfers.erase(transferIter);
+
+        return newState;
+    }
+
+    void validateAtEnd() const
+    {
+        for (auto& transfer : mSharedState->mTransfers)
+        {
+            ereport(WARNING,
+                    (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                     errmsg("unfinished transfer detected %s -> %s: %g, withdrawal without deposit",
+                            transfer.mSourceAccount.c_str(), transfer.mDestinationAccount.c_str(), transfer.mAmount)));
+        }
+
+        for (auto& [account, accountEntry] : mSharedState->mAccountEntries)
+        {
+            if (std::abs(accountEntry.mAmount) >= AMOUNT_EPSILON)
+            {
+                ereport(INFO,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("remaining amount detected %s %g, not all amount was realized at end",
+                                account.c_str(), accountEntry.mAmount)));
+            }
+        }
+    }
+
+private:
+    void realizeImpl(CbAcbAccountEntry& accountEntry, double price, double amount)
+    {
+        mCostBasisBefore = accountEntry.mCostBasis;
+        mBalanceBefore = accountEntry.mAmount;
+        mBalanceAfter = accountEntry.mAmount + amount;
+
+        if (std::abs(mBalanceAfter) < AMOUNT_EPSILON)
+            mBalanceAfter = 0.0;
+
+        // -- open position, increase position
+        if (std::signbit(mBalanceBefore) == std::signbit(amount))
+        {
+            mCostBasisAfter = (accountEntry.mCostBasis * accountEntry.mAmount + price * amount) / (accountEntry.mAmount + amount);
+        }
+        // close position and do NOT cross 0 volume
+        // cost basis doesn't change as a result
+        else if (std::signbit(mBalanceBefore) == std::signbit(mBalanceAfter))
+        {
+            mCostBasisAfter = mCostBasisBefore;
+            mCapitalGain += amount * (mCostBasisBefore - price);
+        }
+        // close position and cross 0
+        // cost basis becomes equal to price
+        else
+        {
+            mCostBasisAfter = price;
+            mCapitalGain += mBalanceBefore * (price - mCostBasisBefore);
+        }
+
+        accountEntry.mCostBasis = mCostBasisAfter;
+        accountEntry.mAmount = mBalanceAfter;
+    }
 };
 
 // IMPORTANT: If this fails, change the expected size and adjust(!!!) pg_cost_basis--1.0.sql
-static_assert(sizeof(CbAcbState) == 40);
+static_assert(sizeof(CbAcbState) == 48);
+
+}
+
+extern "C" {
 
 PG_FUNCTION_INFO_V1(CbAcbState_in);
 Datum CbAcbState_in(PG_FUNCTION_ARGS)
 {
-    char* str = PG_GETARG_CSTRING(0);
-
-    double a;
-    double b;
-    double c;
-    double d;
-    double e;
-
-    if (sscanf(str, " ( %lf , %lf , %lf , %lf , %lf )", &a, &b, &c, &d, &e) != 5)
-    {
-      ereport(ERROR,
-              (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-               errmsg("invalid input syntax for AcbState: \"%s\"", str)));
-    }
-
-    CbAcbState* state = new (palloc(sizeof(CbAcbState))) CbAcbState{a, b, c, d, e};
+    CbAcbState* state = CbAcbState::newState();
     PG_RETURN_POINTER(state);
 }
 
@@ -85,79 +282,7 @@ Datum CbAcbState_capital_gain(PG_FUNCTION_ARGS)
 PG_FUNCTION_INFO_V1(CbAcb_sfunc);
 Datum CbAcb_sfunc(PG_FUNCTION_ARGS)
 {
-    if (PG_ARGISNULL(0)) [[unlikely]]
-    {
-        ereport(ERROR,
-                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                 errmsg("acb state can't be null")));
-    }
-    CbAcbState* state = reinterpret_cast<CbAcbState*>(PG_GETARG_POINTER(0));
-
-    if (PG_ARGISNULL(2)) [[unlikely]]
-    {
-        ereport(ERROR,
-                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                 errmsg("amount can't be null null")));
-    }
-    double amount = PG_GETARG_FLOAT8(2);
-
-    void* buffer = palloc(sizeof(CbAcbState));
-    CbAcbState* newState;
-
-    // CbAcbState (cost_basis_before, cost_basis_after, balance_before, balance_after, capital_gains)
-    // std::signbit - returns false for positives, true for negatives
-
-    if (amount == 0) [[unlikely]]
-    {
-        newState = new (buffer) CbAcbState{
-                state->mCostBasisAfter, state->mCostBasisAfter,
-                state->mBalanceAfter, state->mBalanceAfter,
-                0.0
-        };
-    }
-    else
-    {
-        if (PG_ARGISNULL(1)) [[unlikely]]
-        {
-            ereport(ERROR,
-                    (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                     errmsg("price can't be null")));
-        }
-        double price = PG_GETARG_FLOAT8(1);
-
-        // -- open position, increase position
-        if (std::signbit(state->mBalanceAfter) == std::signbit(amount))
-        {
-            newState = new (buffer) CbAcbState{
-                    state->mCostBasisAfter, (state->mCostBasisAfter * state->mBalanceAfter + price * amount) / (state->mBalanceAfter + amount),
-                    state->mBalanceAfter, state->mBalanceAfter + amount,
-                    0.0
-            };
-        }
-        // close position and do NOT cross 0 volume
-        // cost basis doesn't change as a result
-        else if (std::signbit(state->mBalanceAfter) == std::signbit(state->mBalanceAfter + amount))
-        {
-            newState = new (buffer) CbAcbState{
-                    state->mCostBasisAfter, state->mCostBasisAfter,
-                    state->mBalanceAfter, state->mBalanceAfter + amount,
-                    amount * (state->mCostBasisAfter - price)
-            };
-        }
-        // close position and cross 0
-        // cost basis becomes equal to price
-        else
-        {
-            newState = new (buffer) CbAcbState{
-                    state->mCostBasisAfter, price,
-                    state->mBalanceAfter, state->mBalanceAfter + amount,
-                    state->mBalanceAfter * (price - state->mCostBasisAfter)
-            };
-        }
-    }
-
-    PG_RETURN_POINTER(newState);
+    return commonSFunc<CbAcbState>(fcinfo);
 }
 
 } // extern "C"
-
