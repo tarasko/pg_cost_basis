@@ -64,6 +64,72 @@ CREATE OR REPLACE AGGREGATE cb_acb(price float, amount float)
     parallel = safe
 );
 
+CREATE TYPE cb_acb2_state;
+
+CREATE FUNCTION cb_acb2_state_in(cstring)
+    RETURNS cb_acb2_state
+    AS 'MODULE_PATHNAME', 'CbAcb2State_in'
+    LANGUAGE C IMMUTABLE STRICT
+    PARALLEL SAFE;
+
+CREATE FUNCTION cb_acb2_state_out(cb_acb2_state)
+    RETURNS cstring
+    AS 'MODULE_PATHNAME', 'CbAcb2State_out'
+    LANGUAGE C IMMUTABLE STRICT
+    PARALLEL SAFE;
+
+CREATE FUNCTION cb_acb2_cost_basis_before(cb_acb2_state)
+    RETURNS float
+    AS 'MODULE_PATHNAME', 'CbAcb2State_cost_basis_before'
+    LANGUAGE C IMMUTABLE STRICT
+    PARALLEL SAFE;
+
+CREATE FUNCTION cb_acb2_cost_basis_after(cb_acb2_state)
+    RETURNS float
+    AS 'MODULE_PATHNAME', 'CbAcb2State_cost_basis_after'
+    LANGUAGE C IMMUTABLE STRICT
+    PARALLEL SAFE;
+
+CREATE FUNCTION cb_acb2_balance_before(cb_acb2_state)
+    RETURNS float
+    AS 'MODULE_PATHNAME', 'CbAcb2State_balance_before'
+    LANGUAGE C IMMUTABLE STRICT
+    PARALLEL SAFE;
+
+CREATE FUNCTION cb_acb2_balance_after(cb_acb2_state)
+    RETURNS float
+    AS 'MODULE_PATHNAME', 'CbAcb2State_balance_after'
+    LANGUAGE C IMMUTABLE STRICT
+    PARALLEL SAFE;
+
+CREATE FUNCTION cb_acb2_capital_gain(cb_acb2_state)
+    RETURNS float
+    AS 'MODULE_PATHNAME', 'CbAcb2State_capital_gain'
+    LANGUAGE C IMMUTABLE STRICT
+    PARALLEL SAFE;
+
+CREATE TYPE cb_acb2_state (
+   internallength = 48,
+   input = cb_acb2_state_in,
+   output = cb_acb2_state_out,
+   alignment = double
+);
+
+CREATE FUNCTION cb_acb2_sfunc(cb_acb2_state, account text, source_or_destination_account text, price float, amount float, tag bigint, prev_tag bigint, ignore_transfer bool, transfer_id text)
+    RETURNS cb_acb2_state
+    AS 'MODULE_PATHNAME', 'CbAcb2_sfunc'
+    LANGUAGE C IMMUTABLE
+    PARALLEL SAFE;
+
+CREATE OR REPLACE AGGREGATE cb_acb2(account text, source_or_destination_account text, price float, amount float, tag bigint, prev_tag bigint, ignore_transfer bool, transfer_id text)
+(
+    sfunc = cb_acb2_sfunc,
+    stype = cb_acb2_state,
+    -- cost_basis_before, cost_basis_after, balance_before, balance_after, capital_gain
+    initcond = '(1,1,0,0,0)',
+    parallel = safe
+);
+
 CREATE TYPE cb_fifo_state;
 
 CREATE FUNCTION cb_fifo_state_in(cstring)

@@ -1,4 +1,5 @@
-#include "pg_allocator.h"
+#include "common.h"
+#include "sfunc.h"
 
 #include <string>
 #include <string_view>
@@ -17,35 +18,14 @@ extern "C"
 #include <utils/array.h>
 #include <utils/jsonb.h>
 #include <fmgr.h>
-#include <varatt.h>
 }
 
 namespace {
 
-template<typename CharT, typename Traits = std::char_traits<CharT>>
-using PgBasicString = std::basic_string<CharT, Traits, PgAllocator<CharT>>;
-
-using PgString = PgBasicString<char>;
-
 template<typename T>
 using PgDeque = std::deque<T, PgAllocator<T>>;
 
-template<typename T>
-using PgVector = std::vector<T, PgAllocator<T>>;
-
-template<typename Key, typename T, typename Hash = std::hash<Key>, typename Comp = std::equal_to<Key>>
-using PgUnorderedMap = std::unordered_map<Key, T, Hash, Comp, PgAllocator<std::pair<const Key, T>>>;
-
 } // namespace {
-
-template<>
-struct std::hash<PgString> : private std::hash<std::string_view>
-{
-    [[nodiscard]] std::size_t operator()(const PgString& s) const
-    {
-        return std::hash<std::string_view>::operator()(std::string_view{s});
-    }
-};
 
 namespace {
 
@@ -54,19 +34,7 @@ char jsAmountKey[] = "a";
 char jsPlKey[] = "pl";
 char jsCostBasisKey[] = "cb";
 
-// Treat all amounts below AMOUNT_EPSILON as zeros
-const double AMOUNT_EPSILON = 1e-12;
-
-// Verify that incoming transfer amount is equal to outgoing transfer amount with the following abs precision
-const double TRANSFER_AMOUNT_EPSILON = 1e-8;
-
-template<typename StringType>
-[[nodiscard]] inline StringType textToString(text* t)
-{
-    return StringType{VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t)};
-}
-
-struct CbAccountEntry
+struct CbFifoAccountEntry
 {
     PgString mOriginatingAccount;
     int64_t mOriginatingTag;
@@ -74,44 +42,19 @@ struct CbAccountEntry
     double mAmount;
 };
 
-struct CbTransfer
-{
-    // Some transfers can provide unique transfer id, in this case it's a preferred way to match outgoing and incoming records
-    std::optional<PgString> mTransferId;
-
-    // For the rest, we rely on triplet (source, dest, amount)
-    PgString mSourceAccount;
-    PgString mDestinationAccount;
-    double mAmount;
-
-    PgVector<CbAccountEntry> mEntries;
-
-    bool operator==(const CbTransfer& o) const
-    {
-        if (mTransferId.has_value() && o.mTransferId.has_value())
-            return mTransferId == o.mTransferId;
-
-        // if mTransferId is defined for either in or out record then it should be defined for both records
-        if (mTransferId.has_value() != o.mTransferId.has_value())
-            return false;
-
-        return mSourceAccount == o.mSourceAccount && mDestinationAccount == o.mDestinationAccount && std::abs(mAmount - o.mAmount) < TRANSFER_AMOUNT_EPSILON;
-    }
-};
-
 class CbFifoState
 {
-    using Fifo = PgDeque<CbAccountEntry>;
+    using Fifo = PgDeque<CbFifoAccountEntry>;
 
     // Use vector instead of deque since we don't need to pop_front
     // Default-constructed empty deque is also allocating twice to initialize its internal structure.
     // We don't want that, typically half of records are acquisions (amount > 0), they have empty realized list.
-    using RealizedList = PgVector<CbAccountEntry>;
+    using RealizedList = PgVector<CbFifoAccountEntry>;
 
     struct SharedState
     {
         PgUnorderedMap<PgString, Fifo> mAccountEntries;
-        PgVector<CbTransfer> mTransfers;
+        PgVector<CbTransfer<CbFifoAccountEntry>> mTransfers;
     };
 
     CbFifoState(SharedState* sharedState, double price) : mSharedState{sharedState}, mLastPrice{price} {}
@@ -135,7 +78,7 @@ public:
     {
         CbFifoState::Fifo& accountFifo = mSharedState->mAccountEntries[account];
 
-        CbTransfer transfer{txId, account, destinationAccount, -amount, {}};
+        CbTransfer<CbFifoAccountEntry> transfer{txId, account, destinationAccount, -amount, {}};
 
         // Amount is always negative because initiating records always withdraw funds
         double remainingAmountToTransfer = -amount;
@@ -147,7 +90,7 @@ public:
             {
                 ereport(ERROR,
                         (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                         errmsg("%ld: attempt to transfer from account \"%s\" that has negative balance records",
+                         errmsg("tag %ld: attempt to transfer from account \"%s\" that has negative balance records",
                                 tag, account.c_str())));
                 return newState(this);
             }
@@ -155,12 +98,12 @@ public:
             if (remainingAmountToTransfer > entry.mAmount)
             {
                 remainingAmountToTransfer -= entry.mAmount;
-                transfer.mEntries.push_back(CbAccountEntry{entry.mOriginatingAccount, entry.mOriginatingTag, entry.mCostBasis, entry.mAmount});
+                transfer.mEntries.push_back(CbFifoAccountEntry{entry.mOriginatingAccount, entry.mOriginatingTag, entry.mCostBasis, entry.mAmount});
                 accountFifo.pop_front();
             }
             else
             {
-                transfer.mEntries.push_back(CbAccountEntry{entry.mOriginatingAccount, entry.mOriginatingTag, entry.mCostBasis, remainingAmountToTransfer});
+                transfer.mEntries.push_back(CbFifoAccountEntry{entry.mOriginatingAccount, entry.mOriginatingTag, entry.mCostBasis, remainingAmountToTransfer});
                 entry.mAmount -= remainingAmountToTransfer;
                 remainingAmountToTransfer = 0.0;
                 if (entry.mAmount < AMOUNT_EPSILON)
@@ -172,14 +115,14 @@ public:
         {
             if (price.has_value())
             {
-                transfer.mEntries.push_back(CbAccountEntry{account, tag, *price, remainingAmountToTransfer});
-                accountFifo.push_back(CbAccountEntry{account, tag, *price, -remainingAmountToTransfer});
+                transfer.mEntries.push_back(CbFifoAccountEntry{account, tag, *price, remainingAmountToTransfer});
+                accountFifo.push_back(CbFifoAccountEntry{account, tag, *price, -remainingAmountToTransfer});
             }
             else
             {
                 ereport(ERROR,
                         (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                         errmsg("%ld: not enough balance on \"%s\", %g left untransfered",
+                         errmsg("tag %ld: not enough balance on \"%s\", %g left untransfered",
                                 tag, account.c_str(), remainingAmountToTransfer)));
             }
         }
@@ -193,13 +136,13 @@ public:
     {
         CbFifoState::Fifo& accountFifo = mSharedState->mAccountEntries[account];
 
-        CbTransfer transferKey{transferId, sourceAccount, account, amount, {}};
+        CbTransfer<CbFifoAccountEntry> transferKey{transferId, sourceAccount, account, amount, {}};
         auto transferIter = std::find(mSharedState->mTransfers.begin(), mSharedState->mTransfers.end(), transferKey);
         if (transferIter == mSharedState->mTransfers.end()) [[unlikely]]
         {
             ereport(ERROR,
                     (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                     errmsg("%ld: can't finalize transfer %s -> %s %g, unable to match with initiating record",
+                     errmsg("tag %ld: can't finalize transfer %s -> %s %g, unable to match with initiating record",
                             tag, sourceAccount.c_str(), account.c_str(), amount)));
             return newState(this);
         }
@@ -208,7 +151,7 @@ public:
         {
             ereport(ERROR,
                     (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                     errmsg("%ld: can't finalize transfer, in/out amounts mismatch: %g, %g",
+                     errmsg("tag %ld: can't finalize transfer, in/out amounts mismatch: %g, %g",
                             tag, transferIter->mAmount, amount)));
             return newState(this);
         }
@@ -381,7 +324,7 @@ private:
             if (std::signbit(entry.mAmount) == std::signbit(entry.mAmount + remainingAmount))
             {
                 // don't cross 0
-                mLastRealized.push_back(CbAccountEntry{entry.mOriginatingAccount, entry.mOriginatingTag, entry.mCostBasis, -remainingAmount});
+                mLastRealized.push_back(CbFifoAccountEntry{entry.mOriginatingAccount, entry.mOriginatingTag, entry.mCostBasis, -remainingAmount});
                 entry.mAmount += remainingAmount;
                 remainingAmount = 0.0;
                 if (std::abs(entry.mAmount) < AMOUNT_EPSILON)
@@ -390,14 +333,14 @@ private:
             else
             {
                 // cross 0
-                mLastRealized.push_back(CbAccountEntry{entry.mOriginatingAccount, entry.mOriginatingTag, entry.mCostBasis, entry.mAmount});
+                mLastRealized.push_back(CbFifoAccountEntry{entry.mOriginatingAccount, entry.mOriginatingTag, entry.mCostBasis, entry.mAmount});
                 remainingAmount += entry.mAmount;
                 accountFifo.pop_front();
             }
         }
 
         if (std::abs(remainingAmount) >= AMOUNT_EPSILON)
-            accountFifo.push_back(CbAccountEntry{account, tag, price, remainingAmount});
+            accountFifo.push_back(CbFifoAccountEntry{account, tag, price, remainingAmount});
     }
 
     // Allocated in CurTransactionContext, shared between calls, never freed explicitly
@@ -458,95 +401,7 @@ Datum CbFifo_realized_entries(PG_FUNCTION_ARGS)
 PG_FUNCTION_INFO_V1(CbFifo_sfunc);
 Datum CbFifo_sfunc(PG_FUNCTION_ARGS)
 {
-    if (PG_ARGISNULL(5)) [[unlikely]]
-    {
-        ereport(ERROR,
-                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                 errmsg("tag is null")));
-    }
-    int64_t tag = PG_GETARG_INT64(5);
-
-    if (PG_ARGISNULL(0)) [[unlikely]]
-    {
-        ereport(ERROR,
-                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                 errmsg("%lu: fifo state can't be null", tag)));
-    }
-    CbFifoState* state = reinterpret_cast<CbFifoState*>(PG_GETARG_POINTER(0));
-
-    if (PG_ARGISNULL(1)) [[unlikely]]
-    {
-        ereport(ERROR,
-                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                 errmsg("%lu: account can't be null", tag)));
-    }
-    PgString account = textToString<PgString>(PG_GETARG_TEXT_PP(1));
-
-    if (PG_ARGISNULL(4)) [[unlikely]]
-    {
-        ereport(ERROR,
-                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                 errmsg("%lu: amount can't be null null", tag)));
-    }
-    double amount = PG_GETARG_FLOAT8(4);
-
-    // Reset the state when there is no previous tag in the group
-    // I was very surprised to learn that
-    // cb_fifo(...) over (partition by ... order by tag)
-    // doesn't create a new aggregate for each partition, but just tries to re-use state from previous partition
-    // This helps to detect that we begin with a new partition.
-    if (PG_ARGISNULL(6)) [[unlikely]]
-    {
-        state->validateAtEnd();
-        state = CbFifoState::newState();
-    }
-
-    CbFifoState* newState;
-
-    if (PG_ARGISNULL(2)) [[likely]]
-    {
-        if (PG_ARGISNULL(3)) [[unlikely]]
-        {
-            ereport(ERROR,
-                    (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                     errmsg("%lu: price can't be null", tag)));
-        }
-        double price = PG_GETARG_FLOAT8(3);
-
-        newState = state->realize(account, price, amount, tag);
-    }
-    else
-    {
-        bool ignoreTransfer = false;
-        if (!PG_ARGISNULL(7))
-            ignoreTransfer = PG_GETARG_BOOL(7);
-
-        std::optional<double> price;
-        if (!PG_ARGISNULL(3))
-            price = PG_GETARG_FLOAT8(3);
-
-        if (ignoreTransfer)
-            newState = CbFifoState::newState(state);
-        else
-        {
-            std::optional<PgString> transferId;
-            if (!PG_ARGISNULL(8))
-                transferId = textToString<PgString>(PG_GETARG_TEXT_PP(8));
-
-            if (amount < 0)
-            {
-                PgString destinationAccount = textToString<PgString>(PG_GETARG_TEXT_PP(2));
-                newState = state->initiateTransfer(account, destinationAccount, transferId, amount, price, tag);
-            }
-            else
-            {
-                PgString sourceAccount = textToString<PgString>(PG_GETARG_TEXT_PP(2));
-                newState = state->finalizeTransfer(account, sourceAccount, transferId, amount, tag);
-            }
-        }
-    }
-
-    PG_RETURN_POINTER(newState);
+    return commonSFunc<CbFifoState>(fcinfo);
 }
 
 }
