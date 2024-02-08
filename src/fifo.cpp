@@ -1,23 +1,15 @@
 #include "common.h"
 #include "sfunc.h"
 
-#include <string>
-#include <string_view>
-#include <optional>
-#include <vector>
 #include <deque>
-#include <unordered_map>
 #include <numeric>
 #include <cmath>
 
 extern "C"
 {
-#include <postgres.h>
 #include <catalog/pg_type_d.h>
-#include <utils/memutils.h>
 #include <utils/array.h>
 #include <utils/jsonb.h>
-#include <fmgr.h>
 }
 
 namespace {

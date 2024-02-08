@@ -1,3 +1,5 @@
+#include "common.h"
+
 #include <cmath>
 
 extern "C"
@@ -125,22 +127,30 @@ Datum CbAcb0_sfunc(PG_FUNCTION_ARGS)
         }
         double price = PG_GETARG_FLOAT8(1);
 
+        double balanceAfter = state->mBalanceAfter + amount;
+        if (std::abs(balanceAfter) < AMOUNT_EPSILON)
+            balanceAfter = 0.0;
+
         // -- open position, increase position
         if (std::signbit(state->mBalanceAfter) == std::signbit(amount))
-        {
+        {            
+            double costBasisAfter = balanceAfter == 0.0 ?
+                        state->mCostBasisAfter :
+                        (state->mCostBasisAfter * state->mBalanceAfter + price * amount) / balanceAfter;
+
             newState = new (buffer) CbAcb0State{
-                    state->mCostBasisAfter, (state->mCostBasisAfter * state->mBalanceAfter + price * amount) / (state->mBalanceAfter + amount),
-                    state->mBalanceAfter, state->mBalanceAfter + amount,
+                    state->mCostBasisAfter, costBasisAfter,
+                    state->mBalanceAfter, balanceAfter,
                     0.0
             };
         }
         // close position and do NOT cross 0 volume
         // cost basis doesn't change as a result
-        else if (std::signbit(state->mBalanceAfter) == std::signbit(state->mBalanceAfter + amount))
+        else if (std::signbit(state->mBalanceAfter) == std::signbit(balanceAfter))
         {
             newState = new (buffer) CbAcb0State{
                     state->mCostBasisAfter, state->mCostBasisAfter,
-                    state->mBalanceAfter, state->mBalanceAfter + amount,
+                    state->mBalanceAfter, balanceAfter,
                     amount * (state->mCostBasisAfter - price)
             };
         }
@@ -150,7 +160,7 @@ Datum CbAcb0_sfunc(PG_FUNCTION_ARGS)
         {
             newState = new (buffer) CbAcb0State{
                     state->mCostBasisAfter, price,
-                    state->mBalanceAfter, state->mBalanceAfter + amount,
+                    state->mBalanceAfter, balanceAfter,
                     state->mBalanceAfter * (price - state->mCostBasisAfter)
             };
         }

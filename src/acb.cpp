@@ -3,12 +3,6 @@
 
 #include <cmath>
 
-extern "C"
-{
-#include <postgres.h>
-#include <fmgr.h>
-}
-
 namespace {
 
 struct CbAcbAccountEntry
