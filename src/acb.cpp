@@ -91,7 +91,9 @@ class CbAcbState
                                 tag, account.c_str(), std::abs(mBalanceAfter))));
                 return newState;
             }
-            newState->mCostBasisAfter = (accountEntry.mCostBasis * accountEntry.mAmount + *price * amount) / (accountEntry.mAmount + amount);
+            newState->mCostBasisAfter = newState->mBalanceAfter == 0.0 ?
+                        newState->mCostBasisBefore :
+                        (accountEntry.mCostBasis * accountEntry.mAmount + *price * amount) / newState->mBalanceAfter;
 
             transfer.mEntries.push_back({*price, -amount});
 
@@ -200,7 +202,9 @@ private:
         // -- open position, increase position
         if (std::signbit(mBalanceBefore) == std::signbit(amount))
         {
-            mCostBasisAfter = (accountEntry.mCostBasis * accountEntry.mAmount + price * amount) / (accountEntry.mAmount + amount);
+            mCostBasisAfter = mBalanceAfter == 0.0 ?
+                        mCostBasisBefore :
+                        (accountEntry.mCostBasis * accountEntry.mAmount + price * amount) / mBalanceAfter;
         }
         // close position and do NOT cross 0 volume
         // cost basis doesn't change as a result
