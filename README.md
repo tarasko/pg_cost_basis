@@ -92,7 +92,7 @@ from (
 )
 ```
 
-|account|dest_account|price|amount|tag|transfer_id|capital_gain|realized_tags|realized_entries|
+|account|dest_account|price|amount|tag|transfer_id|capital_gain|balance_before|balance_after|cost_basis_before|cost_basis_after|
 |-------|------------|-----|------|---|-----------|------------|-------------|----------------|
 |exch_2|[NULL]|1,000|3|1|[NULL]|0|0|3|1|1,000|
 |exch_1|[NULL]|1,100|1|2|[NULL]|0|0|1|1|1,100|
