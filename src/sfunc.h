@@ -56,6 +56,8 @@ Datum commonSFunc(PG_FUNCTION_ARGS)
 
     CostBasisState* newState;
 
+    // if source_or_destination defined then it is a transfer
+
     if (PG_ARGISNULL(2)) [[likely]]
     {
         if (PG_ARGISNULL(3)) [[unlikely]]
