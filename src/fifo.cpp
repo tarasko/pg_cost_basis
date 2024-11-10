@@ -4,6 +4,7 @@
 #include <deque>
 #include <numeric>
 #include <cmath>
+#include <algorithm>
 
 extern "C"
 {

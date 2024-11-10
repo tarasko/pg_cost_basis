@@ -2,6 +2,7 @@
 #include "sfunc.h"
 
 #include <cmath>
+#include <algorithm>
 
 namespace {
 
