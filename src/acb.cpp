@@ -104,7 +104,7 @@ class CbAcbState
                 ereport(ERROR,
                         (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                          errmsg("tag %ld: not enough balance on \"%s\", %g left untransfered",
-                                tag, account.c_str(), std::abs(mBalanceAfter))));
+                                tag, account.c_str(), std::abs(newState->mBalanceAfter))));
                 return newState;
             }
             newState->mCostBasisAfter = *price;

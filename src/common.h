@@ -23,7 +23,7 @@ template<typename Key, typename T, typename Hash = std::hash<Key>, typename Comp
 using PgUnorderedMap = std::unordered_map<Key, T, Hash, Comp, PgAllocator<std::pair<const Key, T>>>;
 
 // Treat all amounts below AMOUNT_EPSILON as zeros
-static constexpr const double AMOUNT_EPSILON = 1e-12;
+static constexpr const double AMOUNT_EPSILON = 1e-11;
 
 // Verify that incoming transfer amount is equal to outgoing transfer amount with the following abs precision
 static constexpr const double TRANSFER_AMOUNT_EPSILON = 1e-8;
